@@ -253,32 +253,61 @@ struct Splitter {
     /// like to split this job.  We always just divide it by two though, so
     /// the effective number of pieces will be `next_power_of_two()`.
     splits: usize,
+
+    /// The most pieces this job may still become, or `usize::MAX` for no
+    /// limit. Every split halves it, and thieves do not reset it: with hundreds
+    /// of idle workers stealing every piece, the reset of `splits` would
+    /// otherwise only stop at single items.
+    pieces: usize,
 }
+
+/// Adaptive splitting of an indexed iterator creates at most `max(MIN_PIECES,
+/// PIECES_PER_THREAD * threads)` pieces: enough to balance uneven items on a
+/// few threads, and few enough with hundreds of threads that their jobs do not
+/// cost more than the items themselves. Unindexed iterators keep no limit:
+/// without a length, a short-circuiting consumer cannot tell a piece that is
+/// still too long to scan.
+const MIN_PIECES: usize = 4096;
+const PIECES_PER_THREAD: usize = 16;
+/// Pieces longer than this many items per thread split even without budget.
+const LONG_PIECE_PER_THREAD: usize = 1 << 20;
 
 impl Splitter {
     #[inline]
     fn new() -> Splitter {
         Splitter {
             splits: crate::current_num_threads(),
+            pieces: usize::MAX,
         }
     }
 
     #[inline]
     fn try_split(&mut self, stolen: bool) -> bool {
-        let Splitter { splits } = *self;
+        let Splitter { splits, pieces } = *self;
 
-        if stolen {
+        if pieces < 2 {
+            false
+        } else if stolen {
             // This job was stolen!  Reset the number of desired splits to the
             // thread count, if that's more than we had remaining anyway.
             self.splits = Ord::max(crate::current_num_threads(), self.splits / 2);
+            self.halve_pieces();
             true
         } else if splits > 0 {
             // We have splits remaining, make it so.
             self.splits /= 2;
+            self.halve_pieces();
             true
         } else {
             // Not stolen, and no more splits -- we're done!
             false
+        }
+    }
+
+    #[inline]
+    fn halve_pieces(&mut self) {
+        if self.pieces != usize::MAX {
+            self.pieces /= 2;
         }
     }
 }
@@ -321,12 +350,23 @@ impl LengthSplitter {
         if min_splits > splitter.inner.splits {
             splitter.inner.splits = min_splits;
         }
+        // A caller that set a maximum length asked for pieces that short.
+        if max == usize::MAX {
+            let threads = crate::current_num_threads();
+            splitter.inner.pieces = Ord::max(MIN_PIECES, threads.saturating_mul(PIECES_PER_THREAD));
+        }
 
         splitter
     }
 
     #[inline]
     fn try_split(&mut self, len: usize, stolen: bool) -> bool {
+        // A piece this long is always worth a job, and short-circuiting
+        // consumers such as `find_last` over huge ranges rely on thieves
+        // splitting it until the piece that holds the answer is short.
+        if len / LONG_PIECE_PER_THREAD >= crate::current_num_threads() {
+            self.inner.pieces = Ord::max(self.inner.pieces, 2);
+        }
         // If splitting wouldn't make us too small, try the inner splitter.
         len / 2 >= self.min && self.inner.try_split(stolen)
     }
